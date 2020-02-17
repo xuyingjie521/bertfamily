@@ -136,16 +136,57 @@ def sequence_masking(x, mask, mode=0, axis=None):
             return x - (1 - mask) * 1e12
 
 
+def batch_gather(params, indices):
+    """
+    同tf旧版本的batch_gather
+    """
+    try:
+        return tf.gather(params, indices, batch_dims=-1)
+    except Exception as e1:
+        try:
+            return tf.batch_gather(params, indices)
+        except Exception as e2:
+            raise ValueError('%s\n%s\n' % (e1.message, e2.message))
+
+
+def pool1d(x,
+           pool_size,
+           strides=1,
+           padding='valid',
+           data_format=None,
+           pool_mode='max'):
+    """
+    向量序列的pool函数
+    """
+    x = K.expand_dims(x, 1)
+    x = K.pool2d(x,
+                 pool_size=(1, pool_size),
+                 strides=(1, strides),
+                 padding=padding,
+                 data_format=data_format,
+                 pool_mode=pool_mode)
+    return x[:, 0]
+
+
+def divisible_temporal_padding(x, n):
+    """
+    将一维向量序列右padding到长度能被n整除
+    """
+    r_len = K.shape(x)[1] % n
+    p_len = K.switch(r_len > 0, n - r_len, 0)
+    return K.temporal_padding(x, (0, p_len))
+
+
 def swish(x):
     """
-    swish函数（这样封装过后才有__name__属性）
+    swish函数（这样封装过后才有 __name__ 属性）
     """
     return tf.nn.swish(x)
 
 
 def leaky_relu(x, alpha=0.2):
     """
-    leaky relu函数（这样封装过后才有__name__属性）
+    leaky relu函数（这样封装过后才有 __name__ 属性）
     """
     return tf.nn.leaky_relu(x, alpha=alpha)
 

@@ -9,6 +9,8 @@ from bertfamily.backend import keras, K
 from bertfamily.backend import search_layer
 from bertfamily.backend import sequence_masking
 from bertfamily.utils import is_string
+from bertfamily.backend import pool1d
+from bertfamily.backend import divisible_temporal_padding
 from keras import initializers, activations
 from keras.layers import *
 
@@ -18,7 +20,7 @@ if keras.__version__[-2:] != 'tf' and keras.__version__ < '2.3':
     class Layer(keras.layers.Layer):
         """
         重新定义Layer，赋予“层中层”功能
-        （迎合keras==2.2.4版本需要）
+        （仅keras 2.3以下版本需要）
         """
         def __setattr__(self, name, value):
             if isinstance(value, keras.layers.Layer):
@@ -51,6 +53,18 @@ if keras.__version__[-2:] != 'tf' and keras.__version__ < '2.3':
             return non_trainable_weights
 
 
+class ZeroMasking(Layer):
+    """啥都不做，就是加上mask
+    """
+    def call(self, inputs):
+        self._output_mask = K.cast(K.greater(inputs, 0), K.floatx())
+        return inputs
+
+    @property
+    def output_mask(self):
+        return self._output_mask
+
+
 class MultiHeadAttention(Layer):
     """多头注意力机制
     """
@@ -58,6 +72,7 @@ class MultiHeadAttention(Layer):
                  heads,
                  head_size,
                  key_size=None,
+                 pool_size=None,
                  kernel_initializer='glorot_uniform',
                  max_relative_position=None,
                  **kwargs):
@@ -65,7 +80,8 @@ class MultiHeadAttention(Layer):
         self.heads = heads
         self.head_size = head_size
         self.out_dim = heads * head_size
-        self.key_size = key_size if key_size else head_size
+        self.key_size = key_size or head_size
+        self.pool_size = pool_size or 1
         self.kernel_initializer = initializers.get(kernel_initializer)
         self.max_relative_position = max_relative_position
 
@@ -101,7 +117,7 @@ class MultiHeadAttention(Layer):
                                                        initializer=initializer,
                                                        trainable=False)
 
-    def call(self, inputs, q_mask=False, v_mask=False, a_mask=False):
+    def call(self, inputs, q_mask=None, v_mask=None, a_mask=None):
         """实现多头注意力
         q_mask: 对输入的query序列的mask。
                 主要是将输出结果的padding部分置0。
@@ -110,18 +126,40 @@ class MultiHeadAttention(Layer):
         a_mask: 对attention矩阵的mask。
                 不同的attention mask对应不同的应用。
         """
-        # 处理mask
-        inputs = inputs[:]
-        for i, mask in enumerate([q_mask, v_mask, a_mask]):
-            if not mask:
-                inputs.insert(3 + i, None)
-        q, k, v, q_mask, v_mask = inputs[:5]
-        if len(inputs) == 5:
-            a_mask = 'history_only'
-        elif len(inputs) == 6:
-            a_mask = inputs[-1]
-        else:
-            raise ValueError('wrong inputs for MultiHeadAttention.')
+        q, k, v = inputs[:3]
+        if a_mask:
+            if len(inputs) == 3:
+                a_mask = 'history_only'
+            else:
+                a_mask = inputs[3]
+        if q_mask is not None:
+            if not hasattr(self, 'q_mask_layer'):
+                self.q_mask_layer = search_layer(q, q_mask)
+            q_mask = self.q_mask_layer.output_mask
+        if v_mask is not None:
+            if not hasattr(self, 'v_mask_layer'):
+                self.v_mask_layer = search_layer(v, v_mask)
+            v_mask = self.v_mask_layer.output_mask
+        # Pooling
+        if self.pool_size > 1:
+            is_self_attention = (q is k is v)
+            q_in_len = K.shape(q)[1]
+            q = sequence_masking(q, q_mask, 0)
+            q = divisible_temporal_padding(q, self.pool_size)
+            q = pool1d(q, self.pool_size, self.pool_size, pool_mode='avg')
+            if is_self_attention:
+                k = v = q
+            else:
+                k = sequence_masking(k, v_mask, 0)
+                k = divisible_temporal_padding(k, self.pool_size)
+                k = pool1d(k, self.pool_size, self.pool_size, pool_mode='avg')
+                v = sequence_masking(v, v_mask, 0)
+                v = divisible_temporal_padding(v, self.pool_size)
+                v = pool1d(v, self.pool_size, self.pool_size, pool_mode='avg')
+            if v_mask is not None:
+                v_mask = v_mask[:, ::self.pool_size]
+            if a_mask is not None and not is_string(a_mask):
+                a_mask = a_mask[..., ::self.pool_size, ::self.pool_size]
         # 线性变换
         qw = self.q_dense(q)
         kw = self.k_dense(k)
@@ -134,11 +172,11 @@ class MultiHeadAttention(Layer):
         a = tf.einsum('bjhd,bkhd->bhjk', qw, kw)
         # 相对位置编码
         if self.max_relative_position is not None:
-            q_ids = K.arange(K.shape(q)[1], dtype='int32')
-            q_ids = K.expand_dims(q_ids, 1)
-            v_ids = K.arange(K.shape(v)[1], dtype='int32')
-            v_ids = K.expand_dims(v_ids, 0)
-            pos_ids = v_ids - q_ids
+            q_idxs = K.arange(0, K.shape(q)[1], dtype='int32')
+            q_idxs = K.expand_dims(q_idxs, 1)
+            v_idxs = K.arange(0, K.shape(v)[1], dtype='int32')
+            v_idxs = K.expand_dims(v_idxs, 0)
+            pos_ids = v_idxs - q_idxs
             pos_ids = K.clip(pos_ids, -self.max_relative_position,
                              self.max_relative_position)
             pos_ids = pos_ids + self.max_relative_position
@@ -148,7 +186,7 @@ class MultiHeadAttention(Layer):
         a = a / self.key_size**0.5
         a = sequence_masking(a, v_mask, 1, -1)
         if a_mask is not None:
-            if is_string(a_mask) and a_mask == 'history_only':
+            if is_string(a_mask):
                 ones = K.ones_like(a[:1, :1])
                 a_mask = (ones - tf.linalg.band_part(ones, -1, 0)) * 1e12
                 a = a - a_mask
@@ -161,6 +199,10 @@ class MultiHeadAttention(Layer):
             o = o + tf.einsum('bhjk,jkd->bjhd', a, pos_embeddings)
         o = K.reshape(o, (-1, K.shape(o)[1], self.out_dim))
         o = self.o_dense(o)
+        # 恢复长度
+        if self.pool_size > 1:
+            o = K.repeat_elements(o, self.pool_size, 1)[:, :q_in_len]
+        # 返回结果
         o = sequence_masking(o, q_mask, 0)
         return o
 
@@ -172,6 +214,7 @@ class MultiHeadAttention(Layer):
             'heads': self.heads,
             'head_size': self.head_size,
             'key_size': self.key_size,
+            'pool_size': self.pool_size,
             'kernel_initializer': initializers.serialize(self.kernel_initializer),
             'max_relative_position': self.max_relative_position,
         }
@@ -284,22 +327,15 @@ class PositionEmbedding(Layer):
         )
 
     def call(self, inputs):
-        """如果inputs是一个list，则默认第二个输入是传入的位置id，否则
-        是默认顺序id，即[0, 1, 2, 3, ...]
-        """
-        if isinstance(inputs, list):
-            inputs, pos_ids = inputs
-            pos_embeddings = K.gather(self.embeddings, pos_ids)
-        else:
-            input_shape = K.shape(inputs)
-            batch_size, seq_len = input_shape[0], input_shape[1]
-            pos_embeddings = self.embeddings[:seq_len]
-            pos_embeddings = K.expand_dims(pos_embeddings, 0)
-            pos_embeddings = K.tile(pos_embeddings, [batch_size, 1, 1])
+        input_shape = K.shape(inputs)
+        batch_size, seq_len = input_shape[0], input_shape[1]
+        pos_embeddings = self.embeddings[:seq_len]
+        pos_embeddings = K.expand_dims(pos_embeddings, 0)
 
         if self.merge_mode == 'add':
             return inputs + pos_embeddings
         else:
+            pos_embeddings = K.tile(pos_embeddings, [batch_size, 1, 1])
             return K.concatenate([inputs, pos_embeddings])
 
     def compute_output_shape(self, input_shape):
@@ -383,12 +419,14 @@ class FeedForward(Layer):
                  groups=1,
                  activation='relu',
                  kernel_initializer='glorot_uniform',
+                 pool_size=None,
                  **kwargs):
         super(FeedForward, self).__init__(**kwargs)
         self.units = units
         self.groups = groups
         self.activation = activations.get(activation)
         self.kernel_initializer = initializers.get(kernel_initializer)
+        self.pool_size = pool_size or 1
 
     def build(self, input_shape):
         super(FeedForward, self).build(input_shape)
@@ -411,9 +449,25 @@ class FeedForward(Layer):
                                       groups=self.groups,
                                       kernel_initializer=self.kernel_initializer)
 
-    def call(self, inputs):
-        x = self.dense_1(inputs)
+    def call(self, inputs, mask=None):
+        x = inputs
+        # Pooling
+        if self.pool_size > 1:
+            if mask is not None:
+                if not hasattr(self, 'mask_layer'):
+                    self.mask_layer = search_layer(x, mask)
+                mask = self.mask_layer.output_mask
+            x_in_len = K.shape(x)[1]
+            x = sequence_masking(x, mask, 0)
+            x = divisible_temporal_padding(x, self.pool_size)
+            x = pool1d(x, self.pool_size, self.pool_size, pool_mode='avg')
+        # 执行FFN
+        x = self.dense_1(x)
         x = self.dense_2(x)
+        # 恢复长度
+        if self.pool_size > 1:
+            x = K.repeat_elements(x, self.pool_size, 1)[:, :x_in_len]
+        # 返回结果
         return x
 
     def get_config(self):
@@ -421,6 +475,7 @@ class FeedForward(Layer):
             'units': self.units,
             'activation': activations.serialize(self.activation),
             'kernel_initializer': initializers.serialize(self.kernel_initializer),
+            'pool_size': self.pool_size,
         }
         base_config = super(FeedForward, self).get_config()
         return dict(list(base_config.items()) + list(config.items()))
@@ -464,13 +519,261 @@ class EmbeddingDense(Layer):
         return dict(list(base_config.items()) + list(config.items()))
 
 
+class ConditionalRandomField(Layer):
+    """纯Keras实现CRF层
+    CRF层本质上是一个带训练参数的loss计算层。
+    """
+    def __init__(self, lr_multiplier=1, **kwargs):
+        super(ConditionalRandomField, self).__init__(**kwargs)
+        self.lr_multiplier = lr_multiplier  # 当前层学习率的放大倍数
+
+    def build(self, input_shape):
+        output_dim = input_shape[-1]
+        if not isinstance(output_dim, int):
+            output_dim = output_dim.value
+        self.trans = self.add_weight(name='trans',
+                                     shape=(output_dim, output_dim),
+                                     initializer='glorot_uniform',
+                                     trainable=True)
+        if self.lr_multiplier != 1:
+            K.set_value(self.trans, K.eval(self.trans) / self.lr_multiplier)
+            self.trans = self.lr_multiplier * self.trans
+
+    def target_score(self, y_true, y_pred, mask=None):
+        """计算目标路径的相对概率（还没有归一化）
+        要点：逐标签得分，加上转移概率得分。
+        """
+        y_true = sequence_masking(y_true, mask, 0)
+        point_score = tf.einsum('bni,bni->b', y_true, y_pred)  # 逐标签得分
+        trans_score = tf.einsum('bni,ij,bnj->b', y_true[:, :-1], self.trans,
+                                y_true[:, 1:])  # 标签转移得分
+        return point_score + trans_score
+
+    def log_norm_step(self, inputs, states):
+        """递归计算归一化因子
+        要点：1、递归计算；2、用logsumexp避免溢出。
+        """
+        inputs, mask = inputs[:, :-1], inputs[:, -1:]
+        states = K.expand_dims(states[0], 2)  # (batch_size, output_dim, 1)
+        trans = K.expand_dims(self.trans, 0)  # (1, output_dim, output_dim)
+        outputs = tf.reduce_logsumexp(states + trans, 1)  # (batch_size, output_dim)
+        outputs = outputs + inputs
+        outputs = mask * outputs + (1 - mask) * states[:, :, 0]
+        return outputs, [outputs]
+
+    def call(self, inputs, mask=None):
+        """CRF本身不改变输出，它只是一个loss
+        """
+        if mask is not None:
+            if not hasattr(self, 'mask_layer'):
+                self.mask_layer = search_layer(inputs, mask)
+
+        return inputs
+
+    @property
+    def output_mask(self):
+        if hasattr(self, 'mask_layer'):
+            return self.mask_layer.output_mask
+
+    def dense_loss(self, y_true, y_pred):
+        """y_true需要是one hot形式
+        """
+        mask = self.output_mask
+        # 计算目标分数
+        target_score = self.target_score(y_true, y_pred, mask)
+        # 递归计算log Z
+        init_states = [y_pred[:, 0]]
+        if mask is None:
+            mask = K.ones_like(y_pred[:, :, :1])
+        else:
+            mask = K.expand_dims(mask, 2)
+        y_pred = K.concatenate([y_pred, mask])
+        log_norm, _, _ = K.rnn(self.log_norm_step,
+                               y_pred[:, 1:],
+                               init_states)  # 最后一步的log Z向量
+        log_norm = tf.reduce_logsumexp(log_norm, 1)  # logsumexp得标量
+        # 计算损失 -log p
+        return log_norm - target_score
+
+    def sparse_loss(self, y_true, y_pred):
+        """y_true需要是整数形式（非one hot）
+        """
+        # y_true需要重新明确一下dtype和shape
+        y_true = K.cast(y_true, 'int32')
+        y_true = K.reshape(y_true, [K.shape(y_true)[0], -1])
+        # 转为one hot
+        y_true = K.one_hot(y_true, K.shape(self.trans)[0])
+        return self.dense_loss(y_true, y_pred)
+
+    def dense_accuracy(self, y_true, y_pred):
+        """训练过程中显示逐帧准确率的函数，排除了mask的影响
+        此处y_true需要是one hot形式
+        """
+        y_true = K.argmax(y_true, 2)
+        return self.sparse_accuracy(y_true, y_pred)
+
+    def sparse_accuracy(self, y_true, y_pred):
+        """训练过程中显示逐帧准确率的函数，排除了mask的影响
+        此处y_true需要是整数形式（非one hot）
+        """
+        mask = self.output_mask
+        # y_true需要重新明确一下dtype和shape
+        y_true = K.cast(y_true, 'int32')
+        y_true = K.reshape(y_true, [K.shape(y_true)[0], -1])
+        # 逐标签取最大来粗略评测训练效果
+        y_pred = K.cast(K.argmax(y_pred, 2), 'int32')
+        isequal = K.cast(K.equal(y_true, y_pred), K.floatx())
+        if mask is None:
+            return K.mean(isequal)
+        else:
+            return K.sum(isequal * mask) / K.sum(mask)
+
+    def get_config(self):
+        config = {
+            'lr_multiplier': self.lr_multiplier,
+        }
+        base_config = super(ConditionalRandomField, self).get_config()
+        return dict(list(base_config.items()) + list(config.items()))
+
+
+class MaximumEntropyMarkovModel(Layer):
+    """（双向）最大熵隐马尔可夫模型
+    作用和用法都类似CRF，但是比CRF更快更简单。
+    """
+    def __init__(self, lr_multiplier=1, **kwargs):
+        super(MaximumEntropyMarkovModel, self).__init__(**kwargs)
+        self.lr_multiplier = lr_multiplier  # 当前层学习率的放大倍数
+
+    def build(self, input_shape):
+        output_dim = input_shape[-1]
+        if not isinstance(output_dim, int):
+            output_dim = output_dim.value
+        self.trans = self.add_weight(name='trans',
+                                     shape=(output_dim, output_dim),
+                                     initializer='glorot_uniform',
+                                     trainable=True)
+        if self.lr_multiplier != 1:
+            K.set_value(self.trans, K.eval(self.trans) / self.lr_multiplier)
+            self.trans = self.lr_multiplier * self.trans
+
+    def call(self, inputs, mask=None):
+        """MEMM本身不改变输出，它只是一个loss
+        """
+        if mask is not None:
+            if not hasattr(self, 'mask_layer'):
+                self.mask_layer = search_layer(inputs, mask)
+
+        return inputs
+
+    @property
+    def output_mask(self):
+        if hasattr(self, 'mask_layer'):
+            return self.mask_layer.output_mask
+
+    def reverse_sequence(self, inputs, mask=None):
+        if mask is None:
+            return [x[:, ::-1] for x in inputs]
+        else:
+            length = K.cast(K.sum(mask, 1), 'int32')
+            return [
+                tf.reverse_sequence(x, length, seq_axis=1)
+                for x in inputs
+            ]
+
+    def basic_loss(self, y_true, y_pred, go_backwards=False):
+        """y_true需要是整数形式（非one hot）
+        """
+        mask = self.output_mask
+        # y_true需要重新明确一下dtype和shape
+        y_true = K.cast(y_true, 'int32')
+        y_true = K.reshape(y_true, [K.shape(y_true)[0], -1])
+        # 是否反转序列
+        if go_backwards:
+            y_true, y_pred = self.reverse_sequence([y_true, y_pred], mask)
+            trans = K.transpose(self.trans)
+        else:
+            trans = self.trans
+        # 计算loss
+        histoty = K.gather(trans, y_true)
+        histoty = K.concatenate([y_pred[:, :1], histoty[:, :-1]], 1)
+        y_pred = (y_pred + histoty) / 2
+        loss = K.sparse_categorical_crossentropy(y_true, y_pred, from_logits=True)
+        if mask is None:
+            return K.mean(loss)
+        else:
+            return K.sum(loss * mask) / K.sum(mask)
+
+    def sparse_loss(self, y_true, y_pred):
+        """y_true需要是整数形式（非one hot）
+        """
+        loss = self.basic_loss(y_true, y_pred, False)
+        loss = loss + self.basic_loss(y_true, y_pred, True)
+        return loss / 2
+
+    def dense_loss(self, y_true, y_pred):
+        """y_true需要是one hot形式
+        """
+        y_true = K.argmax(y_true, 2)
+        return self.sparse_loss(y_true, y_pred)
+
+    def basic_accuracy(self, y_true, y_pred, go_backwards=False):
+        """训练过程中显示逐帧准确率的函数，排除了mask的影响
+        此处y_true需要是整数形式（非one hot）
+        """
+        mask = self.output_mask
+        # y_true需要重新明确一下dtype和shape
+        y_true = K.cast(y_true, 'int32')
+        y_true = K.reshape(y_true, [K.shape(y_true)[0], -1])
+        # 是否反转序列
+        if go_backwards:
+            y_true, y_pred = self.reverse_sequence([y_true, y_pred], mask)
+            trans = K.transpose(self.trans)
+        else:
+            trans = self.trans
+        # 计算逐标签accuracy
+        histoty = K.gather(trans, y_true)
+        histoty = K.concatenate([y_pred[:, :1], histoty[:, :-1]], 1)
+        y_pred = (y_pred + histoty) / 2
+        y_pred = K.cast(K.argmax(y_pred, 2), 'int32')
+        isequal = K.cast(K.equal(y_true, y_pred), K.floatx())
+        if mask is None:
+            return K.mean(isequal)
+        else:
+            return K.sum(isequal * mask) / K.sum(mask)
+
+    def sparse_accuracy(self, y_true, y_pred):
+        """训练过程中显示逐帧准确率的函数，排除了mask的影响
+        此处y_true需要是整数形式（非one hot）
+        """
+        accuracy = self.basic_accuracy(y_true, y_pred, False)
+        accuracy = accuracy + self.basic_accuracy(y_true, y_pred, True)
+        return accuracy / 2
+
+    def dense_accuracy(self, y_true, y_pred):
+        """训练过程中显示逐帧准确率的函数，排除了mask的影响
+        此处y_true需要是one hot形式
+        """
+        y_true = K.argmax(y_true, 2)
+        return self.sparse_accuracy(y_true, y_pred)
+
+    def get_config(self):
+        config = {
+            'lr_multiplier': self.lr_multiplier,
+        }
+        base_config = super(MaximumEntropyMarkovModel, self).get_config()
+        return dict(list(base_config.items()) + list(config.items()))
+
+
 custom_objects = {
+    'ZeroMasking': ZeroMasking,
     'MultiHeadAttention': MultiHeadAttention,
     'LayerNormalization': LayerNormalization,
     'PositionEmbedding': PositionEmbedding,
     'GroupDense': GroupDense,
     'FeedForward': FeedForward,
     'EmbeddingDense': EmbeddingDense,
+    'ConditionalRandomField': ConditionalRandomField,
+    'MaximumEntropyMarkovModel': MaximumEntropyMarkovModel,
 }
 
 keras.utils.get_custom_objects().update(custom_objects)
