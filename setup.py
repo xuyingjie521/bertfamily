@@ -4,8 +4,8 @@ from setuptools import setup, find_packages
 
 setup(
     name='bertfamily',
-    version='0.0.1',
-    description='轻量级的bert及其变种',
+    version='0.0.5',
+    description='轻量级的bert及其变种xbert',
     license='GNU General Public License',
     url='',
     author='yuyangmu',

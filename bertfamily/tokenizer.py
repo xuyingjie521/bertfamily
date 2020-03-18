@@ -330,50 +330,57 @@ class SpTokenizer(BasicTokenizer):
     """
     基于SentencePiece模型的封装，使用上跟Tokenizer基本一致。
     """
-    def __init__(self, sp_model_path, do_lower_case=False):
-        super(SpTokenizer, self).__init__(do_lower_case)
+    def __init__(self, sp_model_path, *args, **kwargs):
+        super(SpTokenizer, self).__init__(*args, **kwargs)
         import sentencepiece as spm
         self.sp_model = spm.SentencePieceProcessor()
         self.sp_model.Load(sp_model_path)
         self._token_pad = self.sp_model.id_to_piece(self.sp_model.pad_id())
         self._token_unk = self.sp_model.id_to_piece(self.sp_model.unk_id())
-        self._token_pad_id = self.sp_model.piece_to_id(self._token_pad)
-        self._token_cls_id = self.sp_model.piece_to_id(self._token_cls)
-        self._token_sep_id = self.sp_model.piece_to_id(self._token_sep)
-        self._token_unk_id = self.sp_model.piece_to_id(self._token_unk)
-        self._token_mask_id = self.sp_model.piece_to_id(self._token_mask)
         self._vocab_size = self.sp_model.get_piece_size()
 
+        for token in ['pad', 'unk', 'mask', 'start', 'end']:
+            try:
+                _token = getattr(self, '_token_%s' % token)
+                _token_id = self.sp_model.piece_to_id(_token)
+                setattr(self, '_token_%s_id' % token, _token_id)
+            except:
+                pass
+
     def token_to_id(self, token):
-        """
-        token转换为对应的id
+        """token转换为对应的id
         """
         return self.sp_model.piece_to_id(token)
 
     def id_to_token(self, i):
+        """id转换为对应的token
         """
-        id转换为对应的token
-        """
-        return self.sp_model.id_to_piece(i)
+        if i < self._vocab_size:
+            return self.sp_model.id_to_piece(i)
+        else:
+            return ''
 
     def decode(self, ids):
+        """转为可读文本
         """
-        转为可读文本
-        """
-        ids = [i for i in ids if not self._is_special(i)]
-        return self.sp_model.decode_ids(ids)
+        ids = [i for i in ids if self._is_decodable(i)]
+        text = self.sp_model.decode_ids(ids)
+        return text.decode('utf-8') if is_py2 else text
 
     def _tokenize(self, text):
-        """
-        基本分词函数
+        """基本分词函数
         """
         tokens = self.sp_model.encode_as_pieces(text)
         return tokens
 
     def _is_special(self, i):
-        """
-        判断是不是有特殊含义的符号
+        """判断是不是有特殊含义的符号
         """
         return self.sp_model.is_control(i) or \
             self.sp_model.is_unknown(i) or \
             self.sp_model.is_unused(i)
+
+    def _is_decodable(self, i):
+        """判断是否应该被解码输出
+        """
+        return (i < self._vocab_size) and not self._is_special(i)

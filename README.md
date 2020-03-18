@@ -1,5 +1,7 @@
 # bertfamily
-用Keras实现更轻量级的bert及其变种
+- 个人博客：https://blog.csdn.net/xuyingjie125
+- 用Keras实现更轻量级的bert及各种变种xbert
+
 
 
 ## 使用
@@ -14,7 +16,9 @@ pip install git+https://github.com/xuyingjie521/bertfamily.git
 - <strong>Google原版bert</strong>: https://github.com/google-research/bert
 - <strong>哈工大版roberta</strong>: https://github.com/ymcui/Chinese-BERT-wwm
 - <strong>Google原版albert</strong>: https://github.com/google-research/ALBERT
+- <strong>华为的NEZHA: https://github.com/huawei-noah/Pretrained-Language-Model/tree/master/NEZHA
+- <strong>GPT2_ML: https://github.com/imcaspar/gpt2-ml
 
 ## 鸣谢
 - 感谢CyberZHG大佬实现的keras-bert，本实现有不少地方参考了keras-bert的源码，在此衷心感谢大佬的无私奉献。
-- 感谢苏剑林|BoJone大佬实现的keras4bert，本实现有不少地方参考了keras4bert的源码，在此衷心感谢大佬的无私奉献。
+- 感谢苏神实现的bert，本实现有不少地方参考了其bert的源码，在此衷心感谢大佬的无私奉献。
